@@ -8,7 +8,7 @@ import http from 'http';
  * Unmute PulseAudio tts_sink and virtual_mic so TTS audio reaches the meeting.
  * Called before playback, re-muted after via muteTtsAudio().
  */
-function unmuteTtsAudio(): void {
+export function unmuteTtsAudio(): void {
   try {
     execSync('pactl set-sink-mute tts_sink 0', { stdio: 'pipe' });
     execSync('pactl set-source-mute virtual_mic 0', { stdio: 'pipe' });
@@ -22,7 +22,7 @@ function unmuteTtsAudio(): void {
  * Mute PulseAudio tts_sink and virtual_mic to silence the mic.
  * Called after playback completes.
  */
-function muteTtsAudio(): void {
+export function muteTtsAudio(): void {
   try {
     execSync('pactl set-sink-mute tts_sink 1', { stdio: 'pipe' });
     execSync('pactl set-source-mute virtual_mic 1', { stdio: 'pipe' });

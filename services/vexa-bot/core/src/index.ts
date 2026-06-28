@@ -12,8 +12,10 @@ import { browserArgs, getBrowserArgs, getAuthenticatedBrowserArgs, userAgent } f
 import { BotConfig } from "./types";
 import { RecordingService } from "./services/recording";
 import { VideoRecordingService } from "./services/video-recording";
-import { TTSPlaybackService } from "./services/tts-playback";
+import { TTSPlaybackService, unmuteTtsAudio, muteTtsAudio } from "./services/tts-playback";
 import { MicrophoneService } from "./services/microphone";
+import { StewardForwarder, createStewardForwarder } from "./services/steward-forwarder";
+import { startStewardMeetTap, stopStewardMeetTap } from "./services/steward-meet-tap";
 import { MeetingChatService, ChatTranscriptConfig } from "./services/chat";
 import { ScreenContentService, getVirtualCameraInitScript, getVideoBlockInitScript } from "./services/screen-content";
 import { ScreenShareService } from "./services/screen-share"; // kept for Teams; unused for Google Meet camera-feed approach
@@ -146,6 +148,55 @@ let chatService: MeetingChatService | null = null;
 let screenContentService: ScreenContentService | null = null;
 let screenShareService: ScreenShareService | null = null;
 let redisPublisher: RedisClientType | null = null;
+// -------------------------------------------------
+
+// --- StewardAI full-duplex bridge ---
+// The forwarder is a TCP/Unix client to the StewardAI agent's frame server.
+// INBOUND: meeting PCM → agent (fed via feedPcm from the capture taps).
+// OUTBOUND: agent TTS PCM → played to PulseAudio tts_sink via the handle below.
+let stewardForwarder: StewardForwarder | null = null;
+export function getStewardForwarder(): StewardForwarder | null { return stewardForwarder; }
+// Lazily-opened paplay stream carrying the agent's 16 kHz s16le TTS audio.
+// Opened on the first "agentPcm" frame; reset (and re-opened) after a
+// speak_stop barge-in so the next frame starts a fresh stream.
+let stewardTtsStream: { write: (chunk: Buffer) => boolean; end: () => void; onDone: Promise<void> } | null = null;
+// StewardAI agent TTS is sent back at 16 kHz s16le mono (matches transport.py).
+const STEWARD_TTS_SAMPLE_RATE = 16000;
+
+/**
+ * Play one agent→Vexa TTS PCM frame to the PulseAudio tts_sink. Opens the
+ * paplay stream lazily on the first frame (and unmutes tts_sink/virtual_mic so
+ * the audio reaches the virtual mic — startPCMStream does NOT unmute on its
+ * own). Best-effort: never throws into the forwarder's data handler.
+ */
+function playStewardAgentFrame(frame: Buffer): void {
+  try {
+    if (!ttsPlaybackService) return;
+    if (!stewardTtsStream) {
+      // Unmute the PulseAudio path so tts_sink.monitor → virtual_mic carries
+      // audio into the meeting. (mic_on also unmutes the UI mic button.)
+      unmuteTtsAudio();
+      const handle = ttsPlaybackService.startPCMStream(STEWARD_TTS_SAMPLE_RATE, 1, 's16le');
+      stewardTtsStream = handle;
+      handle.onDone
+        .catch(() => { /* paplay exit/interrupt — non-fatal */ })
+        .finally(() => {
+          // Only clear if THIS handle is still current — a barge-in may have
+          // already swapped in a fresh stream we must not null out.
+          if (stewardTtsStream === handle) stewardTtsStream = null;
+        });
+    }
+    stewardTtsStream.write(frame);
+  } catch (err: any) {
+    log(`[Steward] agent frame play error: ${err?.message || err}`);
+    stewardTtsStream = null;
+  }
+}
+
+/** Reset the agent TTS stream (barge-in). Kills paplay so the next frame reopens. */
+function resetStewardTtsStream(): void {
+  stewardTtsStream = null;
+}
 // -------------------------------------------------
 
 // --- Per-speaker transcription pipeline ---
@@ -572,11 +623,37 @@ const handleRedisMessage = async (message: string, channel: string, page: Page |
         await handleSpeakAudioCommand(command);
 
       } else if (command.action === 'speak_stop') {
-        // Interrupt current speech
+        // Interrupt current speech (barge-in). Also reset the StewardAI agent
+        // TTS stream so the next inbound "agentPcm" frame opens a fresh paplay.
         log('Processing speak_stop command');
         if (ttsPlaybackService) {
           ttsPlaybackService.interrupt();
+          resetStewardTtsStream();
           await publishVoiceEvent('speak.interrupted');
+        }
+
+      } else if (command.action === 'mic_on') {
+        // StewardAI: unmute the bot mic so the agent's TTS reaches the meeting.
+        // Lifts BOTH the meeting-UI mic button and the PulseAudio sink/source
+        // (tts_sink.monitor → virtual_mic feeds Chromium's mic input).
+        log('Processing mic_on command');
+        unmuteTtsAudio();
+        if (microphoneService) {
+          microphoneService.clearMuteTimer();
+          await microphoneService.unmute();
+        }
+
+      } else if (command.action === 'mic_off') {
+        // StewardAI: mute the bot mic. Mutes the meeting-UI mic button and the
+        // PulseAudio path. Also stop any in-flight agent TTS playback.
+        log('Processing mic_off command');
+        muteTtsAudio();
+        if (ttsPlaybackService) {
+          ttsPlaybackService.interrupt();
+          resetStewardTtsStream();
+        }
+        if (microphoneService) {
+          await microphoneService.mute();
         }
 
       } else if (command.action === 'chat_send') {
@@ -710,6 +787,14 @@ async function performGracefulLeave(
 
   // Cleanup voice agent services
   try {
+    // StewardAI bridge: tear down the combined-mix tap (best-effort) and close
+    // the forwarder socket. Ordering vs the rest is not critical.
+    if (stewardForwarder) {
+      try { await stopStewardMeetTap(page); } catch { /* best-effort */ }
+      stewardForwarder.close();
+      stewardForwarder = null;
+      stewardTtsStream = null;
+    }
     if (ttsPlaybackService) { ttsPlaybackService.stop(); ttsPlaybackService = null; }
     if (microphoneService) { microphoneService.clearMuteTimer(); microphoneService = null; }
     if (chatService) { await chatService.cleanup(); chatService = null; }
@@ -2613,6 +2698,37 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     }
   } else {
     log('[Bot] Transcription disabled, skipping per-speaker pipeline');
+  }
+
+  // --- StewardAI full-duplex bridge (opt-in via STEWARD_BRIDGE_ENABLED) ---
+  // Connects to the StewardAI agent's frame server. INBOUND meeting PCM is fed
+  // by the capture taps (Meet/Teams worklet in startPerSpeakerAudioCapture;
+  // Zoom parecord tap in zoom/web/recording.ts via getStewardForwarder()).
+  // OUTBOUND agent TTS frames arrive as "agentPcm" and play to tts_sink.
+  if (process.env.STEWARD_BRIDGE_ENABLED === 'true') {
+    try {
+      stewardForwarder = createStewardForwarder({ log });
+      stewardForwarder.on('agentPcm', (frame: Buffer) => playStewardAgentFrame(frame));
+      stewardForwarder.start();
+      log('[Steward] Full-duplex bridge forwarder started');
+      // Meet/Teams: combined-mix tap. (Zoom is wired in its recording module.)
+      if (botConfig.platform === 'google_meet' || botConfig.platform === 'teams') {
+        // Capture the current page handle for the deferred tap (the module-level
+        // `page` is `Page | null` and may be narrowed away across the closure).
+        const tapPage = page;
+        // Delay so the meeting has joined and media elements exist; the tap
+        // also re-scans internally for late joiners. Best-effort, non-blocking.
+        setTimeout(() => {
+          if (stewardForwarder && tapPage) {
+            startStewardMeetTap(tapPage, stewardForwarder).catch((e: any) =>
+              log(`[Steward] Meet/Teams tap setup error: ${e?.message || e}`));
+          }
+        }, 8000);
+      }
+    } catch (err: any) {
+      log(`[Steward] Bridge init failed (non-fatal): ${err?.message || err}`);
+      stewardForwarder = null;
+    }
   }
 
   // Call the appropriate platform handler

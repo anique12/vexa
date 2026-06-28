@@ -60,6 +60,7 @@ import { logJSON } from "../utils/log";
 import { log } from "../utils";
 import { BotConfig } from "../types";
 import { getSegmentPublisher } from "../index";
+import type { StewardForwarder } from "./steward-forwarder"; // additive — StewardAI tap
 
 // ───────────────────────────────────────────────────────────────────────
 // Types
@@ -366,6 +367,15 @@ export class PulseAudioCapture extends EventEmitter implements AudioCaptureSourc
   private seq = 0;
   private stopped = false;
 
+  // ── StewardAI tap (additive) ──────────────────────────────────────────
+  // parecord stdout is already s16le/16k/mono — exactly StewardAI's format.
+  private stewardForwarder: StewardForwarder | null = null;
+  /** Attach a StewardAI forwarder to fan raw PCM out (null disables the tap). */
+  setStewardForwarder(fwd: StewardForwarder | null): void {
+    this.stewardForwarder = fwd;
+  }
+  // ──────────────────────────────────────────────────────────────────────
+
   constructor(opts: PulseAudioCaptureOptions = {}) {
     super();
     this.device = opts.device || process.env.PULSE_SINK || "zoom_sink";
@@ -407,6 +417,20 @@ export class PulseAudioCapture extends EventEmitter implements AudioCaptureSourc
           this.emit("started");
           resolve();
         }
+
+        // ── StewardAI tap (additive) ──────────────────────────────────
+        // buf is raw s16le @ 16 kHz mono — exactly StewardAI's format. The
+        // forwarder reslices to 20 ms (640-byte) frames internally. Wrapped
+        // so a forwarder hiccup can NEVER affect the recording/upload path.
+        if (this.stewardForwarder) {
+          try {
+            this.stewardForwarder.feedPcm(buf);
+          } catch (err: any) {
+            log(`[PulseAudioCapture] steward tap error: ${err?.message || err}`);
+          }
+        }
+        // ──────────────────────────────────────────────────────────────
+
         this._appendAndSlice(buf);
       });
 

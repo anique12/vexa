@@ -1,7 +1,7 @@
 import { Page } from 'playwright';
 import { BotConfig } from '../../../types';
 import { RecordingService } from '../../../services/recording';
-import { getRawCaptureService, getSegmentPublisher } from '../../../index';
+import { getRawCaptureService, getSegmentPublisher, getStewardForwarder } from '../../../index';
 import { log } from '../../../utils';
 import { PulseAudioCapture, UnifiedRecordingPipeline } from '../../../services/audio-pipeline';
 import { zoomParticipantNameSelector } from './selectors';
@@ -44,6 +44,9 @@ export async function startZoomWebRecording(page: Page | null, botConfig: BotCon
       // no per-platform handler needed here.)
       recordingService = new RecordingService(botConfig.meeting_id, sessionUid);
       const source = new PulseAudioCapture();
+      // StewardAI tap (additive): fan raw parecord PCM to the bridge forwarder
+      // if it's enabled. null is fine (tap disabled) when the bridge is off.
+      source.setStewardForwarder(getStewardForwarder());
 
       pipeline = new UnifiedRecordingPipeline({
         source,
