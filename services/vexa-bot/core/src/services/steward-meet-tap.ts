@@ -175,18 +175,20 @@ export async function startStewardMeetTap(
       const findEls = (): HTMLMediaElement[] =>
         Array.from(document.querySelectorAll("audio, video")).filter(
           (el: any) =>
-            !el.paused &&
             el.srcObject instanceof MediaStream &&
             el.srcObject.getAudioTracks().length > 0,
         ) as HTMLMediaElement[];
 
+      // Do NOT early-return on 0 elements: set up the graph + rescan anyway so
+      // elements that appear or start playing after this first pass get picked
+      // up by the rescan (Meet binds/plays them slightly after admission).
       const els = findEls();
-      if (els.length === 0) return 0;
 
       const blob = new Blob([workletSource], { type: "application/javascript" });
       const workletUrl = URL.createObjectURL(blob);
 
       const ctx = new AudioContext(); // native rate (usually 48k)
+      if (ctx.state === "suspended") { try { await ctx.resume(); } catch { /* ignore */ } }
       await ctx.audioWorklet.addModule(workletUrl);
       const node = new (window as any).AudioWorkletNode(ctx, "steward-pcm-worklet");
       const mix = ctx.createGain(); // combined bus
@@ -222,7 +224,7 @@ export async function startStewardMeetTap(
       // Late-joiner re-scan: connect newly-found media elements into the same mix.
       const rescan = setInterval(() => {
         for (const el of findEls()) connectEl(el);
-      }, 15000);
+      }, 3000);
 
       (window as any).__vexaStewardCtx = ctx;
       (window as any).__vexaStewardRescan = rescan;
