@@ -2707,6 +2707,21 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
   // OUTBOUND agent TTS frames arrive as "agentPcm" and play to tts_sink.
   if (process.env.STEWARD_BRIDGE_ENABLED === 'true') {
     try {
+      await page.exposeFunction('__stewardSpeakerEvent',
+        async (speaker: string, event: 'start' | 'end', ts: number) => {
+          try {
+            if (!redisPublisher) return;
+            const meetingId = currentBotConfig?.meeting_id ?? 'unknown';
+            await redisPublisher.publish(
+              `steward_speaker:meeting:${meetingId}`,
+              JSON.stringify({ speaker, event, ts })
+            );
+          } catch (e: any) { log(`[StewardSpeaker] publish failed: ${e?.message || e}`); }
+        });
+    } catch (e: any) {
+      log(`[StewardSpeaker] exposeFunction failed (non-fatal): ${e?.message || e}`);
+    }
+    try {
       stewardForwarder = createStewardForwarder({ log });
       stewardForwarder.on('agentPcm', (frame: Buffer) => playStewardAgentFrame(frame));
       stewardForwarder.start();

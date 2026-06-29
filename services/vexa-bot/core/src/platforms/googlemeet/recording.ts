@@ -359,12 +359,14 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
               if (isCurrentlySpeaking) {
                 if (previousLogicalState !== 'speaking') {
                   (window as any).logBot(`[SpeakerDebug] SPEAKING START: ${participantName} (indicator=${indicatorSpeaking}, classInference=${classInference.speaking})`);
+                  if ((window as any).__stewardSpeakerEvent) (window as any).__stewardSpeakerEvent(participantName, 'start', Date.now());
                   sendGoogleSpeakerEvent('SPEAKER_START', participantElement);
                 }
                 speakingStates.set(participantId, 'speaking');
               } else {
                 if (previousLogicalState === 'speaking') {
                   (window as any).logBot(`[SpeakerDebug] SPEAKING END: ${participantName}`);
+                  if ((window as any).__stewardSpeakerEvent) (window as any).__stewardSpeakerEvent(participantName, 'end', Date.now());
                   sendGoogleSpeakerEvent('SPEAKER_END', participantElement);
                 }
                 speakingStates.set(participantId, 'silent');
