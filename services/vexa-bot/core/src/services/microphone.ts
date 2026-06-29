@@ -13,6 +13,11 @@ export class MicrophoneService {
   private platform: string;
   private _isMuted: boolean = true;
   private muteTimerId: NodeJS.Timeout | null = null;
+  // Intent: should the mic be kept unmuted? While true, a self-heal loop re-unmutes
+  // if the meeting platform mutes the bot externally (Google Meet does this on its
+  // own, behind the bot's back — the stale-flag desync that left StewardAI muted).
+  private _keepUnmuted: boolean = false;
+  private healTimerId: NodeJS.Timeout | null = null;
 
   constructor(page: Page, platform: string) {
     this.page = page;
@@ -24,9 +29,12 @@ export class MicrophoneService {
    * Returns true if mic is now unmuted, false if toggle failed.
    */
   async unmute(): Promise<boolean> {
-    if (!this._isMuted) return true;
-
+    // NOTE: do NOT short-circuit on the internal _isMuted flag. The platform can mute
+    // the bot externally without us knowing, so the flag drifts out of sync with the
+    // real UI. The toggle* methods read the ACTUAL button state and click only if
+    // needed, so always call through to reconcile to reality.
     this.clearMuteTimer();
+    this._keepUnmuted = true;
 
     try {
       let success = false;
@@ -44,6 +52,7 @@ export class MicrophoneService {
       if (success) {
         this._isMuted = false;
         log('[Microphone] Unmuted');
+        this.startSelfHeal();
       }
       return success;
     } catch (err: any) {
@@ -56,8 +65,10 @@ export class MicrophoneService {
    * Mute the microphone.
    */
   async mute(): Promise<boolean> {
-    if (this._isMuted) return true;
-
+    // Intentional mute: stop keeping the mic unmuted + stop the self-heal loop so it
+    // doesn't fight us. Reconcile to reality (no short-circuit on the stale flag).
+    this._keepUnmuted = false;
+    this.stopSelfHeal();
     this.clearMuteTimer();
 
     try {
@@ -108,6 +119,57 @@ export class MicrophoneService {
 
   get isMuted(): boolean {
     return this._isMuted;
+  }
+
+  /**
+   * Self-heal: while we intend to be unmuted (_keepUnmuted), periodically check the
+   * REAL Google Meet mic state and re-unmute if the platform muted us externally.
+   * Meet mutes participants on its own without telling the bot, which previously
+   * left StewardAI silently muted; this reconciles to reality every few seconds.
+   * (Google Meet only — the platform whose external auto-mute we observed.)
+   */
+  private startSelfHeal(): void {
+    this.stopSelfHeal();
+    if (this.platform !== 'google_meet') return;
+    this.healTimerId = setInterval(async () => {
+      if (!this._keepUnmuted || this.page.isClosed()) return;
+      try {
+        if ((await this.isGoogleMeetMicMuted()) === true) {
+          await this.toggleGoogleMeetMic(true);
+          this._isMuted = false;
+          log('[Microphone] Self-heal: platform had muted us externally — re-unmuted');
+        }
+      } catch {
+        /* best-effort; never throw out of the interval */
+      }
+    }, 3000);
+  }
+
+  private stopSelfHeal(): void {
+    if (this.healTimerId) {
+      clearInterval(this.healTimerId);
+      this.healTimerId = null;
+    }
+  }
+
+  /** Read-only: is the Google Meet mic button currently showing muted? null = unknown. */
+  private async isGoogleMeetMicMuted(): Promise<boolean | null> {
+    if (this.page.isClosed()) return null;
+    return await this.page.evaluate(() => {
+      const selectors = [
+        '[aria-label*="Turn on microphone"]',
+        '[aria-label*="Turn off microphone"]',
+        'button[aria-label*="microphone"]',
+        'button[aria-label*="Microphone"]',
+      ];
+      for (const sel of selectors) {
+        const btn = document.querySelector(sel);
+        if (!btn) continue;
+        const a = (btn.getAttribute('aria-label') || '').toLowerCase();
+        return a.includes('turn on') || a.includes('unmute');
+      }
+      return null;
+    });
   }
 
   // --- Google Meet ---
