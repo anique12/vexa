@@ -2722,7 +2722,11 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
       log(`[StewardSpeaker] exposeFunction failed (non-fatal): ${e?.message || e}`);
     }
     try {
-      stewardForwarder = createStewardForwarder({ log });
+      stewardForwarder = createStewardForwarder({
+        log,
+        meetingId: botConfig.meeting_id,
+        nativeMeetingId: botConfig.nativeMeetingId,
+      });
       stewardForwarder.on('agentPcm', (frame: Buffer) => playStewardAgentFrame(frame));
       stewardForwarder.start();
       log('[Steward] Full-duplex bridge forwarder started');

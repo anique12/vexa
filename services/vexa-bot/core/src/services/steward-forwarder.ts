@@ -16,14 +16,20 @@
  *   event (a Node Buffer). index.ts feeds those buffers to TTSPlaybackService so
  *   they play into the meeting via PulseAudio tts_sink.
  *
- * Wire format (BOTH directions) matches src/stewardai/bridge/transport.py:
+ * Wire format (BOTH directions) — type-tagged; MUST byte-match the StewardAI
+ * agent's bridge transport:
  *
- *     frame = [4-byte big-endian uint32 N][N bytes s16le PCM]
+ *     frame = [4-byte big-endian uint32 L][1 byte TYPE][DATA]
  *
- * Outbound (the frames we send) always use N = 640. Inbound (the frames we
- * receive from the agent) may use ANY N — we tolerate partial reads and any
- * frame size exactly like transport.py's reader (n == 0 skipped, n > 1 MiB
- * treated as a desync and the read buffer reset).
+ * where L = 1 + DATA.length (the length counts the type byte + the data).
+ * Types: 0x00 = s16le PCM audio, 0x01 = handshake JSON. On every (re)connect the
+ * forwarder sends a TYPE_HANDSHAKE frame FIRST — UTF-8 JSON
+ * { meeting_id, native_meeting_id, v: 1 } — so the agent binds the connection to
+ * the meeting, then streams TYPE_PCM frames. Outbound PCM DATA is always 640
+ * bytes. Inbound frames (from the agent) may use ANY L — we tolerate partial
+ * reads and any frame size (n == 0 skipped, n > 1 MiB treated as a desync and
+ * the read buffer reset); TYPE_PCM DATA is emitted as "agentPcm", other types
+ * are logged and ignored.
  *
  * Self-contained: uses only Node's `net` and `events` (no new npm deps; `net`
  * is already imported in vexa-bot index.ts). Connect/reconnect is handled
@@ -41,9 +47,25 @@ const FRAME_BYTES = 640; // 20 ms @ 16 kHz mono s16le (320 samples × 2)
 const HEADER_BYTES = 4; // big-endian uint32 length prefix
 const MAX_FRAME = 1 << 20; // 1 MiB — matches transport.py's desync guard
 
+// --- Type-tagged bridge protocol (MUST byte-match the StewardAI agent) ---
+// Every frame on the socket is: [4-byte BE uint32 L][1 byte TYPE][DATA],
+// where L = 1 + DATA.length (the length counts the type byte + the data).
+const TYPE_PCM = 0x00; // s16le PCM audio
+const TYPE_HANDSHAKE = 0x01; // handshake JSON
+
 export type StewardTransport = "tcp" | "unix";
 
 export interface StewardForwarderOptions {
+  /**
+   * Vexa meeting id (INTEGER). Sent in the handshake so the agent binds this
+   * connection to the correct meeting. Threaded from botConfig.meeting_id.
+   */
+  meetingId?: number;
+  /**
+   * Native meeting id (the platform meeting-code string). Sent in the
+   * handshake alongside meetingId. Threaded from botConfig.nativeMeetingId.
+   */
+  nativeMeetingId?: string;
   /** "tcp" | "unix". Default from BRIDGE_TRANSPORT, else "tcp". */
   transport?: StewardTransport;
   /** TCP host. Default from BRIDGE_TCP_HOST, else "127.0.0.1". */
@@ -80,6 +102,8 @@ function resolveOptions(opts: StewardForwarderOptions): Required<
       ? "unix"
       : "tcp";
   return {
+    meetingId: opts.meetingId ?? 0,
+    nativeMeetingId: opts.nativeMeetingId || "",
     transport,
     tcpHost: opts.tcpHost || env.BRIDGE_TCP_HOST || "127.0.0.1",
     tcpPort: opts.tcpPort ?? (env.BRIDGE_TCP_PORT ? parseInt(env.BRIDGE_TCP_PORT, 10) : 8765),
@@ -177,11 +201,44 @@ export class StewardForwarder extends EventEmitter {
     }
   }
 
-  /** Length-prefix one 640-byte frame and write (or queue) it. */
+  /**
+   * Send the handshake frame ([BE32(1+hs.length)][0x01][hs]) as the very first
+   * bytes on the (re)connected socket. hs is UTF-8 JSON:
+   *   { meeting_id: <int>, native_meeting_id: <str>, v: 1 }
+   * Best-effort: writes directly (does not queue) since onConnect guarantees the
+   * socket is connected+writable at this point.
+   */
+  private _sendHandshake(): void {
+    if (!this.socket || !this.socket.writable) return;
+    const hs = Buffer.from(
+      JSON.stringify({
+        meeting_id: this.o.meetingId,
+        native_meeting_id: this.o.nativeMeetingId,
+        v: 1,
+      }),
+      "utf8",
+    );
+    const header = Buffer.allocUnsafe(HEADER_BYTES);
+    header.writeUInt32BE(1 + hs.length, 0); // L counts the type byte + the JSON
+    const packet = Buffer.concat(
+      [header, Buffer.from([TYPE_HANDSHAKE]), hs],
+      HEADER_BYTES + 1 + hs.length,
+    );
+    this.socket.write(packet);
+    this.o.log(
+      `handshake sent (meeting_id=${this.o.meetingId}, native_meeting_id=${this.o.nativeMeetingId})`,
+    );
+  }
+
+  /** Type-tag one 640-byte PCM frame ([BE32(1+len)][0x00][frame]) and write (or queue) it. */
   private _sendFrame(frame: Buffer): void {
     const header = Buffer.allocUnsafe(HEADER_BYTES);
-    header.writeUInt32BE(frame.length, 0); // big-endian uint32, matches transport.py
-    const packet = Buffer.concat([header, frame], HEADER_BYTES + frame.length);
+    // L counts the type byte + the data (matches the agent's transport).
+    header.writeUInt32BE(1 + frame.length, 0);
+    const packet = Buffer.concat(
+      [header, Buffer.from([TYPE_PCM]), frame],
+      HEADER_BYTES + 1 + frame.length,
+    );
 
     if (this.connected && this.socket && this.socket.writable) {
       // writable false / write returning false (backpressure) → still buffered
@@ -220,8 +277,10 @@ export class StewardForwarder extends EventEmitter {
 
   /**
    * INBOUND frame decoder. Appends `chunk` to recvBuf and pulls out every
-   * complete [4-byte BE length][payload] frame, emitting each payload as
-   * "agentPcm". Tolerates partial reads (the tail is carried in recvBuf) and is
+   * complete [4-byte BE length][1-byte TYPE][DATA] frame, where the length N
+   * counts the type byte + the data. For TYPE_PCM frames the DATA (payload minus
+   * the type byte) is emitted as "agentPcm"; any other type is logged and
+   * ignored. Tolerates partial reads (the tail is carried in recvBuf) and is
    * resilient to a desynced/garbage length prefix (resets the buffer rather
    * than allocating wildly). Strictly best-effort: never throws upward.
    */
@@ -235,7 +294,7 @@ export class StewardForwarder extends EventEmitter {
       while (this.recvBuf.length - off >= HEADER_BYTES) {
         const n = this.recvBuf.readUInt32BE(off);
         if (n === 0) {
-          // Zero-length frame — skip the header (matches transport.py).
+          // Zero-length frame — skip the header (matches the agent's transport).
           off += HEADER_BYTES;
           continue;
         }
@@ -251,11 +310,18 @@ export class StewardForwarder extends EventEmitter {
           break;
         }
         const start = off + HEADER_BYTES;
-        // Copy out so the emitted Buffer is stable independent of recvBuf reuse.
+        // The n-byte payload is [1-byte TYPE][DATA]. Copy out so the emitted
+        // Buffer is stable independent of recvBuf reuse.
         const payload = Buffer.from(this.recvBuf.subarray(start, start + n));
         off = start + n;
-        this.framesReceived += 1;
-        this.emit("agentPcm", payload);
+        const type = payload[0];
+        if (type === TYPE_PCM) {
+          this.framesReceived += 1;
+          this.emit("agentPcm", payload.subarray(1));
+        } else {
+          // Unknown/stray frame type — log and ignore, never crash.
+          this.o.log(`recv unknown frame type=0x${type.toString(16)} (len=${n}) — ignored`);
+        }
       }
 
       // Carry the unconsumed tail (partial header or partial payload).
@@ -283,6 +349,9 @@ export class StewardForwarder extends EventEmitter {
           ? `connected (unix ${this.o.socketPath})`
           : `connected (tcp ${this.o.tcpHost}:${this.o.tcpPort})`,
       );
+      // Handshake MUST be the very first bytes on every (re)connect, before any
+      // PCM, so the agent binds this connection to the correct meeting.
+      this._sendHandshake();
       this.emit("connected");
       this._flushPending();
     };
