@@ -156,6 +156,11 @@ class DockerBackend(Backend):
         host_config: dict[str, Any] = {
             "NetworkMode": spec.network or config.DOCKER_NETWORK,
             "AutoRemove": spec.auto_remove,
+            # On Linux, host.docker.internal is NOT provided automatically the way
+            # Docker Desktop (Mac/Windows) does. The StewardAI bot's audio bridge
+            # connects to the mux on the host at host.docker.internal:8765, so map
+            # it to the host gateway explicitly. Redundant-but-harmless on Desktop.
+            "ExtraHosts": ["host.docker.internal:host-gateway"],
         }
         if spec.shm_size:
             host_config["ShmSize"] = spec.shm_size

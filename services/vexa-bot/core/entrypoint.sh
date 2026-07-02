@@ -10,7 +10,12 @@ Xvfb :99 -screen 0 1920x1080x24 &
 
 # Set up PulseAudio for Zoom SDK audio capture
 echo "[Entrypoint] Starting PulseAudio daemon..."
-pulseaudio --start --log-target=syslog 2>/dev/null || true
+# -D (not --start): --start autospawns via D-Bus, which is absent in this container
+# (no /run/dbus/system_bus_socket) so it fails silently and PA never comes up. Set a
+# real XDG_RUNTIME_DIR so pactl/paplay AND the node bot resolve the same native socket.
+export XDG_RUNTIME_DIR=/tmp/pulse-xdg
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+pulseaudio -D --exit-idle-time=-1 --log-target=stderr || true
 sleep 1
 
 # Create a null sink for Zoom SDK audio output
