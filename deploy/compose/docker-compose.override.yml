@@ -1,0 +1,15 @@
+services:
+  # StewardAI test: publish redis to the host so the host-side meeting agent can
+  # send mic/stop commands (bot_commands:meeting:<id>). Remove to revert.
+  redis:
+    ports:
+      - "6380:6379"
+  runtime-api:
+    user: "0:0"
+    environment:
+      # Passed through to the meeting bot via profiles.yaml (low-latency mode).
+      - MIN_AUDIO_DURATION_SEC=${MIN_AUDIO_DURATION_SEC:-0.5}
+      - SUBMIT_INTERVAL_SEC=${SUBMIT_INTERVAL_SEC:-0.5}
+      - IDLE_TIMEOUT_SEC=${IDLE_TIMEOUT_SEC:-0.5}
+    volumes:
+      - ./profiles.yaml:/app/profiles.yaml:ro
