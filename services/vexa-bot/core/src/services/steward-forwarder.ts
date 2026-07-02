@@ -50,8 +50,12 @@ const MAX_FRAME = 1 << 20; // 1 MiB — matches transport.py's desync guard
 // --- Type-tagged bridge protocol (MUST byte-match the StewardAI agent) ---
 // Every frame on the socket is: [4-byte BE uint32 L][1 byte TYPE][DATA],
 // where L = 1 + DATA.length (the length counts the type byte + the data).
-const TYPE_PCM = 0x00; // s16le PCM audio
+const TYPE_PCM = 0x00; // s16le PCM audio (combined mix)
 const TYPE_HANDSHAKE = 0x01; // handshake JSON
+const TYPE_PCM_SPEAKER = 0x02; // [nameLen:u8][name utf8][s16le pcm] — one speaker's segment
+// Keep a single per-speaker frame under the agent's 1 MiB (_MAX_FRAME) cap; a
+// longer utterance is split across frames (agent transcribes each independently).
+const MAX_SPEAKER_PCM = 900_000;
 
 export type StewardTransport = "tcp" | "unix";
 
@@ -249,6 +253,48 @@ export class StewardForwarder extends EventEmitter {
         // Backpressure signal — not fatal; Node will drain. Just note it.
         this.emit("backpressure");
       }
+    } else {
+      this._queue(packet);
+    }
+  }
+
+  /**
+   * Forward one speaker's utterance segment (s16le PCM @ 16 kHz) tagged with the
+   * speaker's display name. Frame: [BE32(1+1+nameLen+pcmLen)][0x02][nameLen:u8]
+   * [name][pcm]. Chunks pcm to stay under the agent's 1 MiB frame cap. Best-effort:
+   * a bad segment is dropped, never thrown.
+   */
+  feedSpeakerPcm(speaker: string, audio: Float32Array): void {
+    try {
+      if (!audio || audio.length === 0) return;
+      // Float32 @ 16 kHz (from Vexa's speakerManager) -> s16le, matching the agent.
+      const pcm = this._f32ToS16le(
+        Buffer.from(audio.buffer, audio.byteOffset, audio.byteLength),
+      );
+      if (pcm.length === 0) return;
+      let name = Buffer.from(String(speaker ?? ""), "utf8");
+      if (name.length > 255) name = name.subarray(0, 255);
+      for (let i = 0; i < pcm.length; i += MAX_SPEAKER_PCM) {
+        this._sendSpeakerFrame(name, pcm.subarray(i, i + MAX_SPEAKER_PCM));
+      }
+    } catch (err: any) {
+      this.o.log(`feedSpeakerPcm error (dropped): ${err?.message || err}`);
+    }
+  }
+
+  /** Type-tag one per-speaker segment ([BE32][0x02][nameLen][name][pcm]) and write (or queue) it. */
+  private _sendSpeakerFrame(name: Buffer, pcm: Buffer): void {
+    const bodyLen = 1 + name.length + pcm.length; // nameLen byte + name + pcm
+    const header = Buffer.allocUnsafe(HEADER_BYTES);
+    header.writeUInt32BE(1 + bodyLen, 0); // + the type byte
+    const packet = Buffer.concat(
+      [header, Buffer.from([TYPE_PCM_SPEAKER]), Buffer.from([name.length]), name, pcm],
+      HEADER_BYTES + 1 + bodyLen,
+    );
+    if (this.connected && this.socket && this.socket.writable) {
+      const ok = this.socket.write(packet);
+      this.framesSent += 1;
+      if (!ok) this.emit("backpressure");
     } else {
       this._queue(packet);
     }

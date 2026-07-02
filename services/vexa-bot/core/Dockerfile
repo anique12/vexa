@@ -14,8 +14,11 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy package files and install dependencies with npm
-COPY package.json package-lock.json ./
+# Copy package files and install dependencies with npm.
+# (package-lock.json is not reliably present in the working tree / can't be
+# generated on macOS due to a native-addon toolchain; install from package.json
+# and let npm resolve inside the linux build image where node-gyp works.)
+COPY package.json ./
 
 RUN npm install
 # Install TypeScript globally to avoid permission issues

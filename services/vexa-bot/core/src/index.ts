@@ -1425,6 +1425,10 @@ async function initPerSpeakerPipeline(botConfig: BotConfig): Promise<boolean> {
     }, 30000);
 
     speakerManager.onSegmentReady = async (speakerId: string, speakerName: string, audioBuffer: Float32Array) => {
+      // StewardAI per-speaker audio is now forwarded as RAW continuous chunks from
+      // handlePerSpeakerAudioData (fed to per-speaker Deepgram streaming). We do NOT
+      // forward here: onSegmentReady re-emits a growing unconfirmed buffer (Vexa's
+      // confirm loop is disabled in Steward mode), which produced duplicated lines.
       if (!transcriptionClient) return;
 
       // Language strategy:
@@ -1806,6 +1810,16 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
     const resolvedName = speakerManager.getSpeakerName(speakerId) || '';
     rawCaptureService.feedAudio(speakerIndex, audioData, resolvedName);
   }
+
+  // StewardAI: forward raw per-speaker speech audio (continuous, VAD-gated) to the
+  // agent's per-speaker Deepgram streaming, keyed by STABLE speaker id + latest
+  // resolved name ("<id>\x1f<name>"). Deepgram does its own endpointing, so this
+  // replaces the growing-segment onSegmentReady forward (which caused duplicate,
+  // ever-growing transcript lines because Vexa's confirm loop is disabled here).
+  try {
+    const fwdName = speakerManager.getSpeakerName(speakerId) || '';
+    stewardForwarder?.feedSpeakerPcm(`${speakerId}\x1f${fwdName}`, audioData);
+  } catch { /* best-effort */ }
 
   speakerManager.feedAudio(speakerId, audioData);
 }
@@ -2464,7 +2478,7 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     }
     
     // Create context with CSP bypass to allow script injection (like Google Meet)
-    const context = await browserInstance.newContext({
+    const context = await browserInstance!.newContext({
       permissions: ['microphone', 'camera'],
       ignoreHTTPSErrors: true,
       bypassCSP: true,
@@ -2539,7 +2553,7 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     });
 
     // Create a new page with permissions and viewport for non-Teams
-    const context = await browserInstance.newContext({
+    const context = await browserInstance!.newContext({
       permissions: ["camera", "microphone"],
       userAgent: userAgent,
       viewport: null, // CDP fullscreen removes browser chrome; window fills the 1920x1080 Xvfb display

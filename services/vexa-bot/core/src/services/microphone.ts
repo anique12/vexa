@@ -18,6 +18,8 @@ export class MicrophoneService {
   // own, behind the bot's back — the stale-flag desync that left StewardAI muted).
   private _keepUnmuted: boolean = false;
   private healTimerId: NodeJS.Timeout | null = null;
+  // Guards against overlapping self-heal passes (each pass awaits DOM work).
+  private _healing: boolean = false;
 
   constructor(page: Page, platform: string) {
     this.page = page;
@@ -36,10 +38,11 @@ export class MicrophoneService {
     this.clearMuteTimer();
     this._keepUnmuted = true;
 
+    let success = false;
     try {
-      let success = false;
       if (this.platform === 'google_meet') {
-        success = await this.toggleGoogleMeetMic(true);
+        // Poll for the mic button — it isn't always mounted the instant mic_on fires.
+        success = await this.toggleGoogleMeetMic(true, 5000);
       } else if (this.platform === 'teams') {
         success = await this.toggleTeamsMic(true);
       } else if (this.platform === 'zoom') {
@@ -48,17 +51,23 @@ export class MicrophoneService {
         log(`[Microphone] Unsupported platform for mic toggle: ${this.platform}`);
         return false;
       }
-
-      if (success) {
-        this._isMuted = false;
-        log('[Microphone] Unmuted');
-        this.startSelfHeal();
-      }
-      return success;
     } catch (err: any) {
-      log(`[Microphone] Unmute failed: ${err.message}`);
-      return false;
+      log(`[Microphone] Unmute error: ${err.message}`);
     }
+
+    if (success) {
+      this._isMuted = false;
+      log('[Microphone] Unmuted');
+    } else {
+      // Don't give up: the button may mount late, or Meet may re-mute us. Self-heal
+      // (started below for Google Meet) keeps reconciling until we're truly unmuted.
+      log('[Microphone] Unmute not confirmed yet — self-heal will keep retrying');
+    }
+    // Always run the self-heal loop for Google Meet while we intend to be unmuted,
+    // even if the immediate toggle didn't confirm — so a late-mounting button or an
+    // external re-mute is corrected instead of leaving the bot silently muted.
+    if (this.platform === 'google_meet') this.startSelfHeal();
+    return success;
   }
 
   /**
@@ -132,15 +141,24 @@ export class MicrophoneService {
     this.stopSelfHeal();
     if (this.platform !== 'google_meet') return;
     this.healTimerId = setInterval(async () => {
-      if (!this._keepUnmuted || this.page.isClosed()) return;
+      if (!this._keepUnmuted || this.page.isClosed() || this._healing) return;
+      this._healing = true;
       try {
-        if ((await this.isGoogleMeetMicMuted()) === true) {
-          await this.toggleGoogleMeetMic(true);
-          this._isMuted = false;
-          log('[Microphone] Self-heal: platform had muted us externally — re-unmuted');
+        const muted = await this.isGoogleMeetMicMuted();
+        // muted===true  -> Meet muted us externally; re-unmute.
+        // muted===null  -> button not found yet (late mount / DOM change); keep trying.
+        // muted===false -> already unmuted; nothing to do.
+        if (muted === true || muted === null) {
+          const ok = await this.toggleGoogleMeetMic(true);
+          if (ok) {
+            this._isMuted = false;
+            log('[Microphone] Self-heal: ensured mic is unmuted');
+          }
         }
       } catch {
         /* best-effort; never throw out of the interval */
+      } finally {
+        this._healing = false;
       }
     }, 3000);
   }
@@ -157,14 +175,19 @@ export class MicrophoneService {
     if (this.page.isClosed()) return null;
     return await this.page.evaluate(() => {
       const selectors = [
-        '[aria-label*="Turn on microphone"]',
-        '[aria-label*="Turn off microphone"]',
-        'button[aria-label*="microphone"]',
-        'button[aria-label*="Microphone"]',
+        'button[aria-label*="Turn on microphone" i]',
+        'button[aria-label*="Turn off microphone" i]',
+        'button[aria-label*="microphone" i]',
+        '[role="button"][aria-label*="microphone" i]',
+        '[aria-label*="microphone" i]',
+        'div[jsname][data-is-muted]',
       ];
       for (const sel of selectors) {
         const btn = document.querySelector(sel);
         if (!btn) continue;
+        const dm = btn.getAttribute('data-is-muted');
+        if (dm === 'true') return true;
+        if (dm === 'false') return false;
         const a = (btn.getAttribute('aria-label') || '').toLowerCase();
         return a.includes('turn on') || a.includes('unmute');
       }
@@ -174,40 +197,74 @@ export class MicrophoneService {
 
   // --- Google Meet ---
 
-  private async toggleGoogleMeetMic(unmute: boolean): Promise<boolean> {
+  // maxWaitMs > 0: poll for the mic button to appear (it isn't always mounted the
+  // instant mic_on fires ~right after join). 0 = single check (self-heal/mute).
+  private async toggleGoogleMeetMic(unmute: boolean, maxWaitMs = 0): Promise<boolean> {
     if (this.page.isClosed()) return false;
 
-    return await this.page.evaluate(async (shouldUnmute: boolean) => {
-      // Use specific selectors for bot's own meeting controls (same as join flow)
-      // Prioritize "Turn on/off microphone" to avoid matching participant tiles
-      const selectors = [
-        '[aria-label*="Turn on microphone"]',
-        '[aria-label*="Turn off microphone"]',
-        'button[aria-label*="Turn on microphone"]',
-        'button[aria-label*="Turn off microphone"]',
-        'button[aria-label*="microphone"]',
-        'button[aria-label*="Microphone"]'
-      ];
+    const result = await this.page.evaluate(
+      async ({ shouldUnmute, maxWait }: { shouldUnmute: boolean; maxWait: number }) => {
+        // Bot's own mic control. `i` = case-insensitive so localized/re-cased labels
+        // still match; the "microphone" contains-match tolerates suffixes like
+        // "Turn off microphone (⌘ + d)".
+        const selectors = [
+          'button[aria-label*="Turn on microphone" i]',
+          'button[aria-label*="Turn off microphone" i]',
+          '[role="button"][aria-label*="Turn on microphone" i]',
+          '[role="button"][aria-label*="Turn off microphone" i]',
+          'button[aria-label*="microphone" i]',
+          '[role="button"][aria-label*="microphone" i]',
+          '[aria-label*="microphone" i]',
+          'div[jsname][data-is-muted]',
+        ];
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+        const find = (): HTMLElement | null => {
+          for (const sel of selectors) {
+            const el = document.querySelector(sel) as HTMLElement | null;
+            if (el) return el;
+          }
+          return null;
+        };
+        const labelOf = (el: HTMLElement) =>
+          (el.getAttribute('aria-label') || el.getAttribute('data-tooltip') || '').toLowerCase();
+        const mutedFrom = (el: HTMLElement) => {
+          const dm = el.getAttribute('data-is-muted');
+          if (dm === 'true') return true;
+          if (dm === 'false') return false;
+          const l = labelOf(el);
+          return l.includes('turn on') || l.includes('unmute');
+        };
 
-      for (const sel of selectors) {
-        const btn = document.querySelector(sel) as HTMLElement | null;
-        if (!btn) continue;
+        // Retry until the control is mounted (or we run out of time).
+        let btn = find();
+        const deadline = Date.now() + Math.max(0, maxWait);
+        while (!btn && Date.now() < deadline) {
+          await sleep(250);
+          btn = find();
+        }
+        if (!btn) return { found: false, clicked: false, label: null, mutedAfter: null };
 
-        const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-        const isMuted = ariaLabel.includes('turn on') || ariaLabel.includes('unmute');
-
-        // Click if state doesn't match desired state
-        if ((shouldUnmute && isMuted) || (!shouldUnmute && !isMuted)) {
+        const before = mutedFrom(btn);
+        let clicked = false;
+        if ((shouldUnmute && before) || (!shouldUnmute && !before)) {
           btn.click();
-          return true;
+          clicked = true;
+          await sleep(350); // let Meet flip the button/aria-label
         }
-        // Already in desired state
-        if ((shouldUnmute && !isMuted) || (!shouldUnmute && isMuted)) {
-          return true;
-        }
-      }
-      return false;
-    }, unmute);
+        const after = find();
+        const mutedAfter = after ? mutedFrom(after) : before;
+        return { found: true, clicked, label: after ? labelOf(after) : labelOf(btn), mutedAfter };
+      },
+      { shouldUnmute: unmute, maxWait: maxWaitMs }
+    );
+
+    log(
+      `[Microphone] GoogleMeet toggle(unmute=${unmute}) -> found=${result.found} ` +
+        `clicked=${result.clicked} mutedAfter=${result.mutedAfter} label="${result.label ?? ''}"`
+    );
+    if (!result.found) return false;
+    // Success = ended in the desired state (not just "found").
+    return unmute ? result.mutedAfter === false : result.mutedAfter === true;
   }
 
   // --- Zoom Web Client ---
