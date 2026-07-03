@@ -168,15 +168,23 @@ export async function joinGoogleMeeting(
     // - "Ask to join" — cookies didn't load (fallback to anonymous)
     const joinNowSelector = 'button:has-text("Join now")';
     const switchHereSelector = 'button:has-text("Switch here")';
-    const askToJoinSelector = googleJoinButtonSelectors[0];
+    // Race over ALL known join-button selectors, not just googleJoinButtonSelectors[0].
+    // An EXTERNAL logged-in account (not a member of the meeting's org) sees "Ask to
+    // join", and that button carries an aria-label — so the [0] selector
+    // `button[jsname]:not([aria-label]):has(span)` EXCLUDES it (verified live: [0]
+    // MISS, but `button:has-text("Ask to join")` and the span-xpath MATCH). Racing all
+    // fallbacks lets whichever one matches this UI win, so the bot actually knocks.
+    const raceArms = [
+      page.waitForSelector(joinNowSelector, { timeout: 30000 }).then(el => ({ el, type: 'join_now' as const })),
+      page.waitForSelector(switchHereSelector, { timeout: 30000 }).then(el => ({ el, type: 'switch_here' as const })),
+      ...googleJoinButtonSelectors.map((sel) =>
+        page.waitForSelector(sel, { timeout: 30000 }).then(el => ({ el, type: 'ask_to_join' as const }))
+      ),
+    ];
 
     try {
       // Race: wait for any join button
-      const joinButton = await Promise.race([
-        page.waitForSelector(joinNowSelector, { timeout: 30000 }).then(el => ({ el, type: 'join_now' as const })),
-        page.waitForSelector(switchHereSelector, { timeout: 30000 }).then(el => ({ el, type: 'switch_here' as const })),
-        page.waitForSelector(askToJoinSelector, { timeout: 30000 }).then(el => ({ el, type: 'ask_to_join' as const })),
-      ]);
+      const joinButton = await Promise.race(raceArms);
 
       if (joinButton.type === 'join_now') {
         await clickHandle(joinButton.el!, "join_now");
@@ -185,9 +193,10 @@ export async function joinGoogleMeeting(
         await clickHandle(joinButton.el!, "switch_here");
         log("Bot joined Google Meet as authenticated user (Switch here — same account already in call).");
       } else {
-        // Cookies didn't work — fall back to anonymous join
-        log("WARNING: Authenticated mode but 'Ask to join' found instead of 'Join now'. Cookies may not be loaded.");
-        log("Falling back to anonymous-style join...");
+        // External account (not a member of the meeting's org) → "Ask to join" is the
+        // EXPECTED button even when fully authenticated. Click it to knock; the host
+        // then admits the bot from the waiting room.
+        log("Authenticated external account: clicking 'Ask to join' (host must admit).");
 
         // Fill name since we're in anonymous territory
         try {
