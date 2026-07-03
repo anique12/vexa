@@ -2428,6 +2428,30 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
 
     log('[Bot] Authenticated persistent context launched');
 
+    // Restore saved Google session cookies BEFORE navigating to the meeting.
+    // Chromium never writes *session* cookies (no expiry — most Google login
+    // cookies) to the on-disk profile, so they must be re-applied on every launch
+    // or the bot is logged out. cdp-cookies.json is a Playwright storageState
+    // 'cookies' array, delivered with the profile (S3) or mounted into the profile.
+    try {
+      const _p = require('path');
+      const _fs = require('fs');
+      const cookiesPath = _p.join(BROWSER_DATA_DIR, 'Default', 'cdp-cookies.json');
+      if (_fs.existsSync(cookiesPath)) {
+        const cookies = JSON.parse(_fs.readFileSync(cookiesPath, 'utf8'));
+        if (Array.isArray(cookies) && cookies.length > 0) {
+          await context.addCookies(cookies);
+          log(`[Bot] Authenticated: restored ${cookies.length} session cookies`);
+        } else {
+          log('[Bot] Authenticated: cdp-cookies.json empty — login may fail');
+        }
+      } else {
+        log('[Bot] Authenticated: no cdp-cookies.json found — login may fail');
+      }
+    } catch (e: any) {
+      log(`[Bot] Warning: session cookie restore failed: ${e.message}`);
+    }
+
     // Apply init scripts to the persistent context
     const isVoiceAgent = !!botConfig.voiceAgentEnabled;
     await context.addInitScript(`window.__vexa_voice_agent_enabled = ${isVoiceAgent};`);
