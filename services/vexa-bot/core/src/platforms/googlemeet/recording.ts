@@ -11,6 +11,7 @@ import {
   googleSilenceClassNames,
   googleParticipantContainerSelectors,
   googleNameSelectors,
+  googleParticipantImageSelectors,
   googleSpeakingIndicators,
   googlePeopleButtonSelectors
 } from "./selectors";
@@ -180,6 +181,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
         silenceClasses: string[];
         containerSelectors: string[];
         nameSelectors: string[];
+        imageSelectors: string[];
         speakingIndicators: string[];
         peopleButtonSelectors: string[];
       };
@@ -276,6 +278,25 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
               return `Google Participant (${idToDisplay})`;
             }
 
+            // Read the participant's profile-image URL off the tile's avatar
+            // <img> (Google Meet renders it as
+            // `https://lh3.googleusercontent.com/...`). Returns null when no
+            // avatar is present (e.g. camera-on tiles, or participants using
+            // the default silhouette avatar with no <img> element at all).
+            function getGoogleParticipantImage(participantElement: HTMLElement): string | null {
+              const imageSelectors: string[] = selectorsTyped.imageSelectors || [];
+              for (const sel of imageSelectors) {
+                const img = participantElement.querySelector(sel) as HTMLImageElement | null;
+                if (img) {
+                  const src = img.getAttribute('src') || img.src || '';
+                  if (src && src.trim() && !src.startsWith('data:image/gif')) {
+                    return src.trim();
+                  }
+                }
+              }
+              return null;
+            }
+
             function isVisible(el: HTMLElement): boolean {
               const cs = getComputedStyle(el);
               const rect = el.getBoundingClientRect();
@@ -320,12 +341,14 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
               const relativeTimestampMs = Date.now() - sessionStartTime;
               const participantId = getGoogleParticipantId(participantElement);
               const participantName = getGoogleParticipantName(participantElement);
+              const participantImage = getGoogleParticipantImage(participantElement);
               // Accumulate for persistence (direct bot accumulation)
               (window as any).__vexaSpeakerEvents = (window as any).__vexaSpeakerEvents || [];
               (window as any).__vexaSpeakerEvents.push({
                 event_type: eventType,
                 participant_name: participantName,
                 participant_id: participantId,
+                participant_image: participantImage,
                 relative_timestamp_ms: relativeTimestampMs,
               });
             }
@@ -443,9 +466,13 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
             // Expose participant name lookup to Node (used by speaker-identity.ts)
             // Returns a map of all known participant names from DOM tiles,
             // keyed by participant-id, plus a list of currently-speaking names.
-            (window as any).__vexaGetAllParticipantNames = (): { names: Record<string, string>; speaking: string[] } => {
+            // `images` is an additive map (id -> avatar URL or null) so
+            // existing consumers destructuring `{ names, speaking }` are
+            // unaffected.
+            (window as any).__vexaGetAllParticipantNames = (): { names: Record<string, string>; speaking: string[]; images: Record<string, string | null> } => {
               const names: Record<string, string> = {};
               const speaking: string[] = [];
+              const images: Record<string, string | null> = {};
               const participantSelectors: string[] = selectorsTyped.participantSelectors || [];
               const seen = new Set<string>();
               participantSelectors.forEach(sel => {
@@ -456,12 +483,13 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                   seen.add(id);
                   const name = getGoogleParticipantName(elh);
                   names[id] = name;
+                  images[id] = getGoogleParticipantImage(elh);
                   if (speakingStates.get(id) === 'speaking') {
                     speaking.push(name);
                   }
                 });
               });
-              return { names, speaking };
+              return { names, speaking, images };
             };
 
             // Polling fallback to catch speaking indicators not driven by class mutations
@@ -701,6 +729,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
         silenceClasses: googleSilenceClassNames,
         containerSelectors: googleParticipantContainerSelectors,
         nameSelectors: googleNameSelectors,
+        imageSelectors: googleParticipantImageSelectors,
         speakingIndicators: googleSpeakingIndicators,
         peopleButtonSelectors: googlePeopleButtonSelectors
       } as any

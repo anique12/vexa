@@ -1414,6 +1414,12 @@ async def list_user_bots(
     def _data_summary(d: dict) -> dict:
         d = d or {}
         participants = d.get("participants") or []
+        # Additive: participant_details is [{name, image}] enrichment of
+        # `participants` (see post_meeting.py aggregate_transcription).
+        # Sliced identically to `participants` to keep the slim list
+        # endpoint's payload bounded; absent on meetings aggregated before
+        # this field existed.
+        participant_details = d.get("participant_details") or []
         notes = d.get("notes")
         transitions = d.get("status_transition") or []
         return {
@@ -1421,6 +1427,7 @@ async def list_user_bots(
             "completion_reason": d.get("completion_reason"),
             "participants": participants[:3],
             "participants_count": len(participants),
+            "participant_details": participant_details[:3],
             "notes_preview": (notes[:120] if isinstance(notes, str) else None),
             "languages": d.get("languages"),
             "last_transition": transitions[-1] if transitions else None,
