@@ -148,6 +148,9 @@ let chatService: MeetingChatService | null = null;
 let screenContentService: ScreenContentService | null = null;
 let screenShareService: ScreenShareService | null = null;
 let redisPublisher: RedisClientType | null = null;
+// Periodic timer that publishes the full participant roster + avatar URLs to
+// StewardAI (steward_roster:meeting:<id>) so it can update attendee photos live.
+let stewardRosterTimer: NodeJS.Timeout | null = null;
 // -------------------------------------------------
 
 // --- StewardAI full-duplex bridge ---
@@ -800,6 +803,7 @@ async function performGracefulLeave(
     if (chatService) { await chatService.cleanup(); chatService = null; }
     if (screenContentService) { await screenContentService.close(); screenContentService = null; }
     if (screenShareService) { screenShareService = null; }
+    if (stewardRosterTimer) { clearInterval(stewardRosterTimer); stewardRosterTimer = null; }
     if (redisPublisher && redisPublisher.isOpen) {
       await redisPublisher.quit();
       redisPublisher = null;
@@ -2758,6 +2762,36 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
         });
     } catch (e: any) {
       log(`[StewardSpeaker] exposeFunction failed (non-fatal): ${e?.message || e}`);
+    }
+    // Publish the FULL participant roster + avatar URLs every 10s (the whole
+    // tile scan, not just speakers) so StewardAI can merge real profile photos
+    // into meetings.attendees[].photoUrl live — no waiting for meeting end, and
+    // it covers silent attendees. Best-effort; a failed tick just skips.
+    try {
+      if (stewardRosterTimer) clearInterval(stewardRosterTimer);
+      stewardRosterTimer = setInterval(async () => {
+        try {
+          if (!redisPublisher || !redisPublisher.isOpen || !page || page.isClosed()) return;
+          const roster = await page.evaluate(() => {
+            const getNames = (window as any).__vexaGetAllParticipantNames;
+            if (typeof getNames !== 'function') return null;
+            const d = getNames() as { names: Record<string, string>; images: Record<string, string | null> };
+            const names = d.names || {};
+            const images = d.images || {};
+            return Object.keys(names).map((id) => ({ name: names[id], image: images[id] ?? null }));
+          });
+          if (roster && roster.length) {
+            const meetingId = currentBotConfig?.meeting_id ?? 'unknown';
+            await redisPublisher.publish(
+              `steward_roster:meeting:${meetingId}`,
+              JSON.stringify({ participants: roster })
+            );
+          }
+        } catch (e: any) { /* transient (page navigating / eval race) — skip this tick */ }
+      }, 10_000);
+      log('[StewardRoster] periodic roster publisher started (10s)');
+    } catch (e: any) {
+      log(`[StewardRoster] failed to start (non-fatal): ${e?.message || e}`);
     }
     try {
       stewardForwarder = createStewardForwarder({
