@@ -76,6 +76,29 @@ def clear_aggregation_failure_class(meeting: Meeting) -> None:
         flag_modified(meeting, "data")
 
 
+def _build_name_to_image_map(speaker_events: list) -> dict:
+    """Build a participant_name -> profile-image URL lookup from the raw
+    speaker_events list persisted on meeting.data (bot-side scrape; see
+    services/vexa-bot/core/src/platforms/googlemeet/recording.ts
+    `getGoogleParticipantImage`). Last-write-wins per name is fine here —
+    a participant's avatar doesn't change mid-meeting, and this is only
+    used to fill in a best-effort `participant_details` list.
+
+    Defensive against malformed/legacy entries: any event missing
+    participant_name, or predating this feature (no participant_image key),
+    is simply skipped/ignored rather than raising.
+    """
+    name_to_image: dict = {}
+    for event in speaker_events or []:
+        if not isinstance(event, dict):
+            continue
+        name = event.get("participant_name")
+        image = event.get("participant_image")
+        if name and image:
+            name_to_image[name] = image
+    return name_to_image
+
+
 async def aggregate_transcription(meeting: Meeting, db: AsyncSession):
     """Fetch transcription segments and aggregate into meeting.data.
 
@@ -151,6 +174,21 @@ async def aggregate_transcription(meeting: Meeting, db: AsyncSession):
             changed = True
         if "languages" not in existing_data and unique_languages:
             existing_data["languages"] = sorted(unique_languages)
+            changed = True
+
+        # Additive: participant_details enriches the plain `participants`
+        # name list with each participant's profile-image URL (e.g. Google
+        # Meet avatar), sourced from the raw speaker_events the bot already
+        # persisted into meeting.data (see callbacks.py status_change /
+        # exited handlers). Null-safe: a name with no known image (older
+        # bot version, non-Google platform, no avatar in the tile) still
+        # gets an entry with image=None rather than being dropped.
+        if "participant_details" not in existing_data and unique_speakers:
+            name_to_image = _build_name_to_image_map(existing_data.get("speaker_events") or [])
+            existing_data["participant_details"] = [
+                {"name": name, "image": name_to_image.get(name)}
+                for name in sorted(unique_speakers)
+            ]
             changed = True
 
         if changed:

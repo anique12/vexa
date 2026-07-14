@@ -1175,6 +1175,7 @@ async def _get_meeting_context(client: httpx.AsyncClient, user_id: str) -> Optio
         # Fetch transcript for each active meeting
         for meeting_id, platform in bot_platforms.items():
             segments = []
+            speaker_events = []
             try:
                 t_resp = await client.get(
                     f"{TRANSCRIPTION_COLLECTOR_URL}/transcripts/{platform}/{meeting_id}",
@@ -1185,17 +1186,38 @@ async def _get_meeting_context(client: httpx.AsyncClient, user_id: str) -> Optio
                     t_data = t_resp.json()
                     all_segments = t_data.get("segments", [])
                     segments = all_segments[-50:]  # latest 50 segments max
+                    # Raw bot-scraped speaker events (participant_name +
+                    # participant_image); used purely to enrich
+                    # `participant_details` below, never to change
+                    # `participants`.
+                    speaker_events = t_data.get("speaker_events") or []
             except Exception:
                 pass
 
             participants = list(set(
                 s.get("speaker", "") for s in segments if s.get("speaker")
             ))
+            # Additive: participant_details = [{name, image}], resolved
+            # best-effort from speaker_events captured during the live
+            # meeting (see services/vexa-bot/core/src/platforms/googlemeet
+            # /recording.ts getGoogleParticipantImage). `participants`
+            # (plain string[]) is left completely unchanged for existing
+            # consumers.
+            name_to_image = {
+                ev.get("participant_name"): ev.get("participant_image")
+                for ev in speaker_events
+                if isinstance(ev, dict) and ev.get("participant_name") and ev.get("participant_image")
+            }
+            participant_details = [
+                {"name": name, "image": name_to_image.get(name)}
+                for name in participants
+            ]
             active_meetings.append({
                 "meeting_id": meeting_id,
                 "platform": platform,
                 "status": "active",
                 "participants": participants,
+                "participant_details": participant_details,
                 "latest_segments": [
                     {
                         "speaker": s.get("speaker", "Unknown"),

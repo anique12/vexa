@@ -212,6 +212,19 @@ export const googleNameSelectors: string[] = [
   '.user-name'
 ];
 
+// Google Meet participant avatar/profile-image selectors. Google serves
+// participant avatars from `lh3.googleusercontent.com` (with
+// `googleusercontent.com` as a slightly looser host match in case the
+// subdomain shifts). Deliberately NO bare `img[src]` last-resort: a
+// participant tile can contain non-avatar icon <img>s (mute/pin/status
+// glyphs), and a generic fallback would grab those instead of the face.
+// If no googleusercontent avatar is present, getGoogleParticipantImage
+// returns null rather than risk a wrong image.
+export const googleParticipantImageSelectors: string[] = [
+  'img[src*="lh3.googleusercontent.com"]',
+  'img[src*="googleusercontent.com"]'
+];
+
 // Google Meet speaking indicators (primary speaker detection)
 export const googleSpeakingIndicators: string[] = [
   // Semantic attribute — survives CSS class rotation across GMeet releases
