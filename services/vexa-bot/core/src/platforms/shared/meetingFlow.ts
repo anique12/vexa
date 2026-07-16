@@ -135,11 +135,25 @@ export async function runMeetingFlow(
       await callStartupCallback(botConfig);
       
       // CRITICAL: Verify bot is still in meeting after callback (prevent false positives)
-      // Use silent check to avoid sending AWAITING_ADMISSION callback again
+      // Use silent check to avoid sending AWAITING_ADMISSION callback again.
+      //
+      // RETRY: right after admission the Meet DOM is mid-transition — WebRTC
+      // re-negotiation of tracks (see triggerPostAdmissionCamera below) plus the
+      // auto-hiding in-call toolbar — so a SINGLE silent check frequently reads
+      // "not admitted" for a genuinely-admitted bot, which then leaves ~1s after
+      // being let in (observed: reason=admission_false_positive right after
+      // "Successfully admitted"). Poll a few times before concluding it's a real
+      // false positive; the DOM settles within a few seconds.
       log("Verifying bot is still in meeting after ACTIVE callback...");
-      const stillAdmitted = await strategies.checkAdmissionSilent(page);
+      let stillAdmitted = false;
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        stillAdmitted = await strategies.checkAdmissionSilent(page);
+        if (stillAdmitted) break;
+        log(`Post-ACTIVE admission check ${attempt}/4 negative — DOM may be mid-transition, retrying...`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
       if (!stillAdmitted) {
-        log("🚨 Bot is NOT in meeting after ACTIVE callback - false positive detected!");
+        log("🚨 Bot is NOT in meeting after ACTIVE callback (4 checks over ~8s) - false positive detected!");
         await gracefulLeaveFunction(page, 0, "admission_false_positive");
         return;
       }
