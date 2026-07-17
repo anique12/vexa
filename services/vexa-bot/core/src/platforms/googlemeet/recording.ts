@@ -285,15 +285,36 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
             // the default silhouette avatar with no <img> element at all).
             function getGoogleParticipantImage(participantElement: HTMLElement): string | null {
               const imageSelectors: string[] = selectorsTyped.imageSelectors || [];
-              for (const sel of imageSelectors) {
-                const img = participantElement.querySelector(sel) as HTMLImageElement | null;
-                if (img) {
-                  const src = img.getAttribute('src') || img.src || '';
-                  if (src && src.trim() && !src.startsWith('data:image/gif')) {
-                    return src.trim();
+              const readImg = (root: ParentNode): string | null => {
+                for (const sel of imageSelectors) {
+                  const img = root.querySelector(sel) as HTMLImageElement | null;
+                  if (img) {
+                    const src = img.getAttribute('src') || img.src || '';
+                    if (src && src.trim() && !src.startsWith('data:image/gif')) {
+                      return src.trim();
+                    }
                   }
                 }
-              }
+                return null;
+              };
+              // 1) Direct hit: works when passed a People-panel row, or a tile
+              // that happens to carry an <img>.
+              const direct = readImg(participantElement);
+              if (direct) return direct;
+              // 2) Video tiles render colored-initial avatars with no <img>, but
+              // the People-panel row for the SAME data-participant-id carries the
+              // real lh3.googleusercontent.com photo. Look it up there.
+              try {
+                const pid = participantElement.getAttribute('data-participant-id')
+                  || getGoogleParticipantId(participantElement);
+                if (pid && pid.indexOf('spaces/') !== -1) {
+                  const panel = document.querySelector('[role="list"][aria-label="Participants"], [role="list"][aria-label="participants"]');
+                  if (panel) {
+                    const row = panel.querySelector('[role="listitem"][data-participant-id="' + pid + '"]') as HTMLElement | null;
+                    if (row) return readImg(row);
+                  }
+                }
+              } catch {}
               return null;
             }
 
@@ -451,14 +472,24 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
               }
             }
 
-            // Attempt to click People button to stabilize DOM if available
-            try {
-              const peopleSelectors: string[] = selectorsTyped.peopleButtonSelectors || [];
-              for (const sel of peopleSelectors) {
-                const btn = document.querySelector(sel) as HTMLElement | null;
-                if (btn && isVisible(btn)) { btn.click(); break; }
-              }
-            } catch {}
+            // Keep the People panel open: it is the only place Google renders
+            // each participant's real avatar <img> (video tiles show colored
+            // initials). Clicked once here, then re-checked periodically because
+            // the button may not be clickable pre-admission and Google can
+            // collapse the panel.
+            const ensurePeoplePanelOpen = () => {
+              try {
+                const panel = document.querySelector('[role="list"][aria-label="Participants"], [role="list"][aria-label="participants"]');
+                if (panel) return; // already open
+                const peopleSelectors: string[] = selectorsTyped.peopleButtonSelectors || [];
+                for (const sel of peopleSelectors) {
+                  const btn = document.querySelector(sel) as HTMLElement | null;
+                  if (btn && isVisible(btn)) { btn.click(); break; }
+                }
+              } catch {}
+            };
+            ensurePeoplePanelOpen();
+            setInterval(ensurePeoplePanelOpen, 5000);
 
             // Initialize
             scanForAllGoogleParticipants();
