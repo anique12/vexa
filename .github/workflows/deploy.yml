@@ -1,0 +1,39 @@
+name: Deploy Vexa to Hetzner
+
+# Deploys the Vexa docker-compose stack to the Hetzner box on pushes to main that
+# touch service/deploy code. The box's authorized_keys pins this key to
+# `deploy/deploy.sh`, which rebuilds ONLY the services that changed (skipping the
+# slow bot image unless bot code changed) and restarts just those containers.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/**"
+      - "libs/**"
+      - "packages/**"
+      - "deploy/compose/**"
+      - "deploy/deploy.sh"
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-vexa-hetzner
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        env:
+          SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+          HOST: ${{ secrets.HETZNER_HOST }}
+          SSH_USER: ${{ secrets.HETZNER_USER }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          # authorized_keys forces `cd /root/vexa && bash deploy/deploy.sh`,
+          # so the command sent here is ignored — kept for clarity.
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes "$SSH_USER@$HOST" deploy
