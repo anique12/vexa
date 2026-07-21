@@ -50,7 +50,7 @@ profiles:
       # the agent process on the Mac host listening on BRIDGE_TCP_PORT.
       STEWARD_BRIDGE_ENABLED: "true"
       BRIDGE_TRANSPORT: "tcp"
-      BRIDGE_TCP_HOST: "host.docker.internal"
+      BRIDGE_TCP_HOST: "172.19.0.1"
       BRIDGE_TCP_PORT: "8765"
     ports:
       "9222/tcp": {}         # CDP debug port

@@ -1,0 +1,10 @@
+# Backend API only. Frontend (meetbase.site + www) is served by Vercel.
+api.meetbase.site {
+    # MeetBase voice-demo + app chat WebSockets run on the host uvicorn (:8080),
+    # reached via the docker bridge gateway.
+    @meetbase_ws path /ws/pipeline* /ws/chat* /ws/stt*
+    reverse_proxy @meetbase_ws 172.19.0.1:8080
+
+    # Everything else -> Vexa API gateway.
+    reverse_proxy api-gateway:8000
+}
